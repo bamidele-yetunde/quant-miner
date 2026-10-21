@@ -1,0 +1,83 @@
+name: alpha-miner
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 */6 * * *"   # safety net: restarts the chain if it ever breaks
+
+concurrency:
+  group: alpha-miner
+  cancel-in-progress: false
+
+permissions:
+  contents: write   # commit miner_state.enc
+  issues: write     # winners -> GitHub issue -> email
+  actions: write    # start the next run
+
+jobs:
+  mine:
+    runs-on: ubuntu-latest
+    timeout-minutes: 358
+    env:
+      BRAIN_EMAIL: ${{ secrets.BRAIN_EMAIL }}
+      BRAIN_PASSWORD: ${{ secrets.BRAIN_PASSWORD }}
+      MINER_STATE_KEY: ${{ secrets.MINER_STATE_KEY }}
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      MINER_MINUTES: ${{ vars.MINER_MINUTES || '335' }}
+      MINER_MAX_SIMS_PER_DAY: ${{ vars.MINER_MAX_SIMS_PER_DAY || '5000' }}
+      MINER_TELEGRAM: ${{ vars.MINER_TELEGRAM || 'all' }}
+      MINER_SCOPES: ${{ vars.MINER_SCOPES }}
+      MINER_LABEL: ${{ vars.MINER_LABEL }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Restore encrypted state
+        id: restore
+        run: python vault.py unpack
+
+      - name: Mine
+        run: python miner.py
+
+      - name: Save encrypted state
+        if: always() && steps.restore.outcome == 'success'
+        run: |
+          python vault.py pack
+          git config user.name "alpha-miner"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add miner_state.enc
+          if git diff --cached --quiet; then exit 0; fi
+          git commit -m "miner: save progress"
+          for i in 1 2 3; do
+            git pull --rebase && git push && exit 0
+            sleep 10
+          done
+          exit 1
+
+      - name: Open an issue for new alphas
+        if: always() && hashFiles('issue.md') != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh issue create --title "New alphas ready - $(date -u +%F)" --body-file issue.md
+
+      - name: Telegram - run failed
+        if: failure()
+        run: python notify.py failed "$RUN_URL"
+
+      - name: Telegram - run stopped
+        if: cancelled()
+        run: python notify.py stopped "$RUN_URL"
+
+      - name: Start the next run
+        if: success() && vars.MINER_CHAIN != 'off'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run alpha-miner.yml --ref "${{ github.ref_name }}"

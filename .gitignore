@@ -1,0 +1,14 @@
+# decrypted miner state: only miner_state.enc (encrypted) is committed
+miner/
+issue.md
+.miner_key
+# local research and WorldQuant documentation
+docs/
+ideas/
+results/
+__pycache__/
+*.pyc
+.env
+
+# the other account's README copy
+README (1).md
