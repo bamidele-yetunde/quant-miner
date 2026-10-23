@@ -36,6 +36,8 @@ MAX_CORRELATION = 0.7      # gate 4: daily-PnL correlation limit
 SCREEN_SHARPE = 1.0        # |Sharpe| that opens a tuning family
 SAME_IDEA_CORR = 0.6       # Telegram: "same idea" / "near-copy" threshold
 CANDIDATES_PER_FAMILY = 4  # best variants put through the gates
+PRECHECK_CORR = 0.75       # a promising screen this close to a submitted alpha isn't worth tuning
+SHARPE_EDGE = 1.1          # BRAIN accepts a correlated alpha if its Sharpe is 10% higher
 
 
 def env_int(name, default):
@@ -49,29 +51,52 @@ MINUTES = env_int("MINER_MINUTES", 0)
 MAX_SIMS = env_int("MINER_MAX_SIMS_PER_DAY", 600)
 CONCURRENCY = env_int("MINER_CONCURRENCY", 3)
 TELEGRAM_MODE = (os.environ.get("MINER_TELEGRAM") or "all").strip().lower()
-SCOPES = os.environ.get("MINER_SCOPES") or "USA/1/TOP3000,USA/1/TOP1000,USA/0/TOP3000,USA/1/TOP500"
-SUB_UNIVERSES = ["TOP1000", "TOP500", "TOPSP500", "TOP200"]   # USA re-tries of TOP3000 winners
+PICKS_PER_DAY = env_int("MINER_PICKS_PER_DAY", 2)
+# Screening happens in one area so every field gets looked at; winners are then re-tried everywhere else.
+SCOPES = os.environ.get("MINER_SCOPES") or "USA/1/TOP3000"
+SUB_UNIVERSES = ["TOP2000", "TOP1000", "TOP500", "TOPSP500", "TOP200"]   # USA re-tries of TOP3000 winners
+GENERIC_FIELDS = {"close", "open", "high", "low", "vwap", "volume", "returns", "cap", "adv20", "sharesout"}
 GRACE_SECONDS = 600        # after the time limit, wait this long for running simulations
 
 # ------------------------------------------------------------ idea space
 # {x} = the prepared field, {w} = lookback window. "unitfree" is used when BRAIN rejects units.
 TEMPLATES = {
-    "revision": {"p": 1, "w": 66,
-                 "f": "group_rank(ts_delta({x}, {w})/(abs(ts_delay({x}, {w})) + 0.0001), industry)",
-                 "unitfree": "group_rank(ts_delta({x}, {w})/abs(ts_delay({x}, {w})), industry)"},
-    "volnorm": {"p": 1, "w": 66,
-                "f": "group_rank(ts_delta({x}, {w})/(ts_std_dev({x}, {w}) + 0.0001), subindustry)",
-                "unitfree": "group_rank(ts_delta({x}, {w})/ts_std_dev({x}, {w}), subindustry)"},
-    "avdiff": {"p": 1, "w": 66, "f": "group_neutralize(ts_av_diff({x}, {w}), subindustry)"},
-    "detrend": {"p": 1, "w": 126, "f": "group_rank(ts_regression({x}, ts_step(1), {w}), industry)",
-                "unitfree": "group_rank(ts_regression(ts_zscore({x}, 252), ts_step(1), {w}), industry)"},
+    # pass 1: the five shapes that found the most, plus two new ones built to be unlike price/volume alphas
     "recency": {"p": 1, "w": 66, "f": "group_rank(-ts_arg_max({x}, {w}), industry)"},
     "volgate": {"p": 1, "w": 126,
                 "f": "trade_when(volume > ts_mean(volume, 20), group_rank(ts_zscore({x}, {w}), industry), -1)"},
-    "zscore": {"p": 2, "w": 126, "f": "ts_zscore({x}, {w})"},
-    "level": {"p": 2, "w": None, "f": "group_rank({x}, subindustry)"},
-    "to_cap": {"p": 2, "w": None, "f": "group_rank({x}/cap, subindustry)"},
+    "volnorm": {"p": 1, "w": 66,
+                "f": "group_rank(ts_delta({x}, {w})/(ts_std_dev({x}, {w}) + 0.0001), subindustry)",
+                "unitfree": "group_rank(ts_delta({x}, {w})/ts_std_dev({x}, {w}), subindustry)"},
+    # how unusual this period's change is, against a year of changes (revision surprise)
+    "revz": {"p": 1, "w": 22, "f": "group_rank(ts_zscore(ts_delta({x}, {w}), 252), industry)"},
+    # ranked within size deciles instead of industries: a different neutralization, so a different PnL
+    "sizebucket": {"p": 1, "w": 126,
+                   "f": 'group_rank(ts_zscore({x}, {w}), bucket(rank(cap), range="0.1,1,0.1"))'},
+    # pass 2
+    "revision": {"p": 2, "w": 66,
+                 "f": "group_rank(ts_delta({x}, {w})/(abs(ts_delay({x}, {w})) + 0.0001), industry)",
+                 "unitfree": "group_rank(ts_delta({x}, {w})/abs(ts_delay({x}, {w})), industry)"},
+    "detrend": {"p": 2, "w": 126, "f": "group_rank(ts_regression({x}, ts_step(1), {w}), industry)",
+                "unitfree": "group_rank(ts_regression(ts_zscore({x}, 252), ts_step(1), {w}), industry)"},
+    "avdiff": {"p": 2, "w": 66, "f": "group_neutralize(ts_av_diff({x}, {w}), subindustry)"},
+    # the data improved but the price hasn't followed yet
+    "pricegap": {"p": 2, "w": 126, "f": "group_rank(ts_rank({x}, {w}) - ts_rank(close, {w}), industry)"},
+    # trade only in calm markets, hold otherwise
+    "calm": {"p": 2, "w": 126,
+             "f": "trade_when(ts_std_dev(returns, 20) < ts_std_dev(returns, 120), "
+                  "group_rank(ts_zscore({x}, {w}), industry), -1)"},
+    # short-term average against long-term average, in units of its own volatility
+    "shortlong": {"p": 2, "w": 66,
+                  "f": "group_rank((ts_mean({x}, 5) - ts_mean({x}, {w}))/ts_std_dev({x}, {w}), subindustry)"},
+    # smoothed peer rank: low turnover, for fast data such as news and sentiment
+    "smooth": {"p": 2, "w": 10, "f": "ts_decay_linear(group_rank({x}, industry), {w})"},
+    # pass 3
+    "zscore": {"p": 3, "w": 126, "f": "ts_zscore({x}, {w})"},
+    "level": {"p": 3, "w": None, "f": "group_rank({x}, subindustry)"},
+    "to_cap": {"p": 3, "w": None, "f": "group_rank({x}/cap, subindustry)"},
     "tsrank": {"p": 3, "w": 252, "f": "group_rank(ts_rank({x}, {w}), industry)"},
+    "pricecorr": {"p": 3, "w": 66, "f": "group_rank(ts_corr({x}, close, {w}), industry)"},
 }
 VALUE_CATEGORIES = {"fundamental", "analyst", "model"}   # where to_cap makes sense
 
@@ -339,6 +364,11 @@ class Miner:
             save(D / "seeds.json", self.seeds)
         self.meta.setdefault("bad_ops", [])
         self.meta.setdefault("bad_universes", [])
+        self.meta.setdefault("bad_tpls", [])
+        self.tpl_stats = defaultdict(Counter)   # template -> {"ok": n, "err": n} over screens
+        for rec in self.tried.values():
+            if rec.get("kind") == "screen" and rec.get("tpl"):
+                self.tpl_stats[rec["tpl"]]["ok" if rec.get("sh") is not None else "err"] += 1
         self.fields = {}
         self.inflight = set()
         self.rejects = Counter()
@@ -419,6 +449,7 @@ class Miner:
             toks = set(re.findall(r"[A-Za-z_][A-Za-z0-9_]*", code))
             subs.append({"id": a["id"], "region": st.get("region"), "delay": st.get("delay"),
                          "universe": st.get("universe"), "date": a.get("dateSubmitted"),
+                         "sh": (a.get("is") or {}).get("sharpe"),
                          "fields": sorted(t for t in toks if t in fds)})
         for s in subs:
             try:
@@ -446,18 +477,15 @@ class Miner:
 
     # --------------------------------------------------------- task sources
     def ordered_fields(self, key):
-        """Interleave datasets, least-crowded fields first; what your portfolio already uses goes last."""
-        fds = self.field_dataset()
-        used = {f for s in self.submitted for f in s["fields"]}
-        ds_count = Counter(ds for s in self.submitted for ds in {fds.get(f) for f in s["fields"]} if ds)
-        crowded = {ds for ds, n in ds_count.items() if n >= 4}
+        """Interleave all datasets, least-crowded fields first; fields a submitted alpha uses go last."""
+        used = {f for s in self.submitted for f in s["fields"]} - GENERIC_FIELDS
 
         def tier(f):
-            return 2 if f["id"] in used else 1 if f["ds"] in crowded else 0
+            return 1 if f["id"] in used else 0
 
         out = []
         fields = self.fields.get(key, [])
-        for t in (0, 1, 2):
+        for t in (0, 1):
             by_ds = defaultdict(list)
             for f in sorted((f for f in fields if tier(f) == t), key=lambda f: f["ac"]):
                 by_ds[f["ds"]].append(f)
@@ -483,6 +511,8 @@ class Miner:
                 for f in fields:
                     for name, t in TEMPLATES.items():
                         if t["p"] != p or (name == "to_cap" and f["cat"] not in VALUE_CATEGORIES):
+                            continue
+                        if name in self.meta["bad_tpls"]:
                             continue
                         if f"S|{scope_key(sc)}|{name}|{f['id']}" in self.screened:
                             continue
@@ -544,7 +574,7 @@ class Miner:
         queued = {t["k"] for t in self.queue}
         added = 0
         for a, c in pairs:
-            if added >= 90:
+            if added >= 30:
                 break
             ea, ec = signed(a["expr"], 1 if a["sh"] > 0 else -1), signed(c["expr"], 1 if c["sh"] > 0 else -1)
             expr = f"rank({ea}) + rank({ec})"
@@ -659,14 +689,41 @@ class Miner:
             with self.lock:
                 self.queue.insert(0, t)
                 self.save_one("queue")
+        if task["kind"] == "screen" and task.get("tpl"):
+            stats = self.tpl_stats[task["tpl"]]
+            stats["ok" if ok else "err"] += 1
+            if stats["err"] >= 20 and stats["ok"] == 0 and task["tpl"] not in self.meta["bad_tpls"]:
+                with self.lock:
+                    self.meta["bad_tpls"].append(task["tpl"])
+                    self.save_one("meta")
+                log(f"template {task['tpl']} fails every time ({rec['msg'][:80] if not IN_CLOUD else ''}) - switched off")
         if task["kind"] in ("screen", "seed", "combo") and ok and abs(rec["sh"]) >= SCREEN_SHARPE:
-            self.open_family(task, rec)
+            close = self.too_close(b, rec)
+            if close:
+                log(f"promising {task['kind']} ({task.get('ds')}, sharpe {rec['sh']}) not tuned: "
+                    f"{close[0]:.2f} correlated with submitted {close[1]}")
+            else:
+                self.open_family(task, rec)
         if task.get("fam"):
             self.maybe_finish(b, task["fam"])
         if task["kind"] == "sub" and ok:
             self.consider_sub(b, task, rec)
 
     # ------------------------------------------------------------- families
+    def too_close(self, b, rec):
+        """(corr, id) if a promising screen already moves like a submitted alpha - not worth ~13 tuning sims."""
+        try:
+            daily = self.pnl(b, rec["id"], cache=False)
+            best, best_id = 0.0, None
+            for s in self.submitted:
+                if s.get("region") == rec["set"]["region"]:
+                    c = abs(correlation(daily, self.pnl(b, s["id"])))   # abs: the idea may get flipped
+                    if c > best:
+                        best, best_id = c, s["id"]
+        except Exception:
+            return None
+        return (best, best_id) if best >= PRECHECK_CORR else None
+
     def open_family(self, task, rec):
         sign = 1 if rec["sh"] > 0 else -1
         neuts = list(dict.fromkeys([task["set"]["neutralization"], *cat_settings(task.get("cat"))[0]]))[:2]
@@ -779,15 +836,19 @@ class Miner:
         if recent < MIN_RECENT_SHARPE:
             return False, {**info, "reason": f"recent Sharpe {recent:.2f}"}
         region = m["set"]["region"]
-        sub_corr, sub_id = 0.0, None
+        sub_corr, sub_id, blocker = 0.0, None, None
         for s in self.submitted:
-            if s.get("region") == region:
-                c = correlation(daily, self.pnl(b, s["id"]))
-                if c > sub_corr:
-                    sub_corr, sub_id = c, s["id"]
+            if s.get("region") != region:
+                continue
+            c = correlation(daily, self.pnl(b, s["id"]))
+            if c > sub_corr:
+                sub_corr, sub_id = c, s["id"]
+            # BRAIN's rule: a correlated alpha is still accepted if its Sharpe is 10% higher
+            if c >= MAX_CORRELATION and (m["sh"] or 0) < SHARPE_EDGE * (s.get("sh") or float("inf")):
+                blocker = blocker or (c, s["id"])
         info["max_corr"], info["closest_submitted"] = round(sub_corr, 2), sub_id
-        if sub_corr >= MAX_CORRELATION:
-            return False, {**info, "reason": f"correlation {sub_corr:.2f} with submitted {sub_id}"}
+        if blocker:
+            return False, {**info, "reason": f"correlation {blocker[0]:.2f} with submitted {blocker[1]}"}
         replace = []
         if not sub_of:
             for w in list(self.ready):
@@ -844,7 +905,9 @@ class Miner:
         header = {"new": "🆕 New idea", "better": f"🔁 Better version of {other}",
                   "same": f"🔂 Same idea as {other}", "near": f"⚠️ Near-copy of your submitted {other}"}[rel]
         if parent:
-            header = f"📉 Smaller universe ({w['set']['universe']}) of {parent}"
+            st = w["set"]
+            header = (f"📉 Delay-0 version of {parent}" if st["delay"] == 0
+                      else f"📉 {st['universe']} version of {parent}")
         log(f"WINNER {w['id']} {w['scope']} sharpe={w['sh']} fit={w['fit']} ({header})", w["expr"])
         if TELEGRAM_MODE == "all" or rel in ("new", "better"):
             st = w["set"]
@@ -866,14 +929,15 @@ class Miner:
             log(f"could not label {w['id']} in BRAIN: {e}")
         if not parent and m["set"]["region"] == "USA" and m["set"]["universe"] == "TOP3000":
             with self.lock:
-                for u in SUB_UNIVERSES:
-                    st = {**m["set"], "universe": u}
+                retries = [{**m["set"], "universe": u} for u in SUB_UNIVERSES] + [{**m["set"], "delay": 0}]
+                for st in retries:
                     if not self.scope_ok(st):
                         continue
                     k = task_key(m["expr"], st)
                     if k not in self.tried:
                         self.queue.insert(0, {"k": k, "kind": "sub", "expr": m["expr"], "set": st,
-                                              "scope": f"{st['region']}/{st['delay']}/{u}", "cat": m.get("cat"),
+                                              "scope": f"{st['region']}/{st['delay']}/{st['universe']}",
+                                              "cat": m.get("cat"),
                                               "ds": m.get("ds"), "field": m.get("field"), "parent": m["id"],
                                               "stability": info["stability"], "pat": m["expr"], "w": None})
                 self.save_one("queue")
@@ -888,31 +952,31 @@ class Miner:
             log(f"{task['set']['universe']} version of {task['parent']} rejected: {info.get('reason')}")
 
     # ---------------------------------------------------------- maintenance
-    def submitted_today(self):
-        today = self.today()
-        return any(ny_date(s.get("date")) == today for s in self.submitted)
-
     def daily_pick(self, b):
-        """One distinct alpha per New York day: the one least correlated with what you submitted."""
+        """PICKS_PER_DAY distinct alphas per New York day: least correlated with what you submitted,
+        and with each other. Re-tried hourly until the day's picks are complete."""
         today, now = self.today(), datetime.now(NY)
         p = self.pick
-        if self.submitted_today():
-            if p.get("done") != today:
-                p.update(done=today)
-                self.save_one("pick")
+        if p.get("day") != today:
+            p.clear()
+            p["day"] = today
+        subs_today = [s["id"] for s in self.submitted if ny_date(s.get("date")) == today]
+        taken = list(dict.fromkeys(p.get("ids", []) + subs_today))
+        if len(subs_today) >= PICKS_PER_DAY:
             return
-        if p.get("done") == today:
-            if now.hour >= 18 and p.get("reminded") != today:
-                notify.send(f"⏰ Reminder: nothing submitted yet today (BRAIN's day ends at midnight New York, "
-                            f"5 AM Nigeria). Today's pick: {p.get('id')}\n{alpha_link(p.get('id'))}")
-                p["reminded"] = today
+        if len(taken) >= PICKS_PER_DAY:
+            if now.hour >= 18 and not p.get("reminded"):
+                left = [i for i in p.get("ids", []) if i not in subs_today]
+                notify.send(f"⏰ Reminder: {len(subs_today)} of {PICKS_PER_DAY} submitted today (BRAIN's day ends at "
+                            f"midnight New York, 5 AM Nigeria). Still to submit: {', '.join(left)}")
+                p["reminded"] = True
                 self.save_one("pick")
             return
         if time.time() - p.get("last_try", 0) < 3600:
             return
         p["last_try"] = time.time()
-        best = None
-        for w in [w for w in self.ready if w["id"] in self.sent]:
+        cands = []
+        for w in [w for w in self.ready if w["id"] in self.sent and w["id"] not in taken]:
             try:
                 chk = b.check(w["id"])
             except Exception as e:
@@ -927,16 +991,24 @@ class Miner:
             daily = self.pnl(b, w["id"])
             mc = max([correlation(daily, self.pnl(b, s["id"])) for s in self.submitted
                       if s.get("region") == w["set"]["region"]] or [0.0])
-            if best is None or mc < best[0]:
-                best = (mc, w)
-        if best:
-            mc, w = best
+            cands.append((mc, w, daily))
+        chosen = []
+        taken_pnl = [self.pnl(b, i) for i in taken]
+        for mc, w, daily in sorted(cands, key=lambda c: c[0]):
+            if len(taken) + len(chosen) >= PICKS_PER_DAY:
+                break
+            if all(correlation(daily, other) < SAME_IDEA_CORR for other in taken_pnl):
+                chosen.append((mc, w))
+                taken_pnl.append(daily)
+        for mc, w in chosen:
             st = w["set"]
-            notify.send(f"📅 Today's submission: {w['id']}\n{st['region']}/D{st['delay']}/{st['universe']} · "
-                        f"Sharpe {w['sh']} · Fitness {w['fit']} · max corr with your submitted alphas {mc:.2f}\n"
-                        f"{alpha_link(w['id'])}")
-            p.update(done=today, id=w["id"])
-            log(f"daily pick: {w['id']} (max corr {mc:.2f})")
+            n = len(taken) + 1
+            notify.send(f"📅 Today's submission {n}/{PICKS_PER_DAY}: {w['id']}\n"
+                        f"{st['region']}/D{st['delay']}/{st['universe']} · Sharpe {w['sh']} · Fitness {w['fit']} · "
+                        f"max corr with your submitted alphas {mc:.2f}\n{alpha_link(w['id'])}")
+            taken.append(w["id"])
+            p.setdefault("ids", []).append(w["id"])
+            log(f"daily pick {n}/{PICKS_PER_DAY}: {w['id']} (max corr {mc:.2f})")
         self.save_one("pick")
 
     def heartbeat(self):
@@ -1096,7 +1168,8 @@ def cmd_status():
     print(f"simulations: {len(m.tried)} total, {m.sims_today()} today")
     print(f"families: {dict(fams)}  verdicts: {dict(verdicts)}")
     print(f"queue: {len(m.queue)}  ready: {len(m.ready)}  sent: {len(m.sent)}  submitted: {len(m.submitted)}")
-    print(f"unavailable operators: {m.meta['bad_ops']}  universes: {m.meta['bad_universes']}")
+    print(f"unavailable operators: {m.meta['bad_ops']}  universes: {m.meta['bad_universes']}  "
+          f"templates switched off: {m.meta['bad_tpls']}")
     for w in m.ready:
         print(f"  {w['id']}  {w['scope']:14} sharpe={w['sh']} fit={w['fit']} stability={w['stability']}")
 

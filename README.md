@@ -149,7 +149,11 @@ simulations of that one shape its new finds kept failing SELF_CORRELATION agains
 | `to_cap` | 2 | `group_rank(x/cap, subindustry)` | Fundamental/analyst value per dollar of market cap (a "yield") |
 | `tsrank` | 3 | `group_rank(ts_rank(x, w), industry)` | Is `x` high versus its own history, compared with industry peers? |
 
-**Combinations of near misses.** At the start of every run the miner takes signals that came close (TOP3000, Delay 1, Sharpe ≥ 1, Fitness 0.5–1.0, failing only on signal strength, not using a field from a submitted alpha). It keeps the best per idea and the top 5 per dataset, then queues up to 90 pairs from different datasets as `rank(A) + rank(B)`. Their noise partly cancels, so a pair often clears Fitness 1.0 where neither signal does alone. Promising pairs are tuned like any other idea.
+**New templates (2026-10-23).** `revz` (how unusual this period's change is against a year of changes), `sizebucket` (ranked within size deciles instead of industries), `pricegap` (the data improved but the price hasn't followed), `calm` (trade only in calm markets), `shortlong` (short vs long average in volatility units), `smooth` (decayed peer rank for fast data) and `pricecorr`. Pass 1 is now `recency`, `volgate`, `volnorm`, `revz`, `sizebucket`. A template that errors on its first 20 screens without one success is switched off automatically.
+
+**Skipping look-alikes early.** Before tuning a promising screen (about 13 simulations), the miner compares its daily PnL with every submitted alpha; at 0.75 or more it is not tuned. A correlated candidate is still accepted when its Sharpe is 10% higher than the alpha it resembles (BRAIN's own rule).
+
+**Combinations of near misses.** At the start of every run the miner takes signals that came close (TOP3000, Delay 1, Sharpe ≥ 1, Fitness 0.5–1.0, failing only on signal strength, not using a field from a submitted alpha). It keeps the best per idea and the top 5 per dataset, then queues up to 30 pairs from different datasets as `rank(A) + rank(B)`. Their noise partly cancels, so a pair often clears Fitness 1.0 where neither signal does alone. Promising pairs are tuned like any other idea.
 
 **Daily pick (country Challenge).** The Nigeria Challenge ranks IS Score, Uniqueness and Days of Submission equally, so one distinct alpha per day beats a burst. Once per New York day, if you haven't submitted yet, the miner re-checks the alphas it already sent you and messages "📅 Today's submission": the one least correlated with your submitted alphas that still passes the official check. Alphas that fail are dropped. If nothing passes, it tries again every hour. After 6 PM New York time (11 PM Nigeria), if you still haven't submitted, it sends one reminder. State is kept in `miner/pick.json`.
 
@@ -364,7 +368,8 @@ work from different copies of the progress and overwrite each other. Disable the
 | Seed ideas | `miner/seeds.json` (encrypted) | ~50 researched signals | Tried before the generic templates |
 | `MINER_LABEL` | repository variable | empty | Prefix for every Telegram message, to tell accounts apart |
 | `MINER_CONCURRENCY` | env / repository variable | `3` | Simulations at once (BRAIN's limit for most users is 3) |
-| `MINER_SCOPES` | env / repository variable | `USA/1/TOP3000,USA/1/TOP1000,USA/0/TOP3000,USA/1/TOP500` | Search areas (region/delay/universe), interleaved |
+| `MINER_SCOPES` | env / repository variable | `USA/1/TOP3000` | Search areas used for screening. Winners are re-tried on TOP2000, TOP1000, TOP500, TOPSP500, TOP200 and Delay 0 automatically |
+| `MINER_PICKS_PER_DAY` | env / repository variable | `2` | How many "📅 Today's submission" picks to send per New York day |
 
 ## 10. Limits, risks and rules
 
