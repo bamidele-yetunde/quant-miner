@@ -558,7 +558,7 @@ class Miner:
             sh, fit = abs(r["sh"]), abs(r.get("fit") or 0)
             if sh < 1.0 or not 0.5 <= fit < 1.0 or set(r.get("fails") or []) - WEAK_FAILS:
                 continue
-            if r.get("field") in used:
+            if r.get("field") in used or "+" in str(r.get("ds")):   # never combine combinations
                 continue
             idea = r.get("field") or r["k"]
             if idea not in best or fit > abs(best[idea].get("fit") or 0):
