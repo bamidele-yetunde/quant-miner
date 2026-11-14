@@ -375,6 +375,7 @@ class Miner:
         self.reject_streak = 0
         self.new_winners = []
         self.fatal = None
+        self.deadline = None
         self.idle_since = None
         self.seed_gen = iter(())
         self.screen_gen = iter(())
@@ -395,6 +396,9 @@ class Miner:
     def save_one(self, name):
         with self.lock:
             save(D / f"{name}.json", getattr(self, {"state": "day"}.get(name, name)))
+
+    def out_of_time(self, margin=0):
+        return self.deadline is not None and time.time() > self.deadline - margin
 
     def today(self):
         return datetime.now(NY).date().isoformat()
@@ -976,7 +980,10 @@ class Miner:
             return
         p["last_try"] = time.time()
         cands = []
-        for w in [w for w in self.ready if w["id"] in self.sent and w["id"] not in taken]:
+        # the 10 strongest only: each official check can take minutes, and the run must end on time
+        for w in [w for w in self.ready if w["id"] in self.sent and w["id"] not in taken][:10]:
+            if self.out_of_time(margin=300):
+                break
             try:
                 chk = b.check(w["id"])
             except Exception as e:
@@ -1033,6 +1040,8 @@ class Miner:
             stuck = [fid for fid, f in self.families.items() if f["status"] == "open"
                      and all(v["k"] in self.tried for v in f["variants"] if self.scope_ok(v["set"]))]
         for fid in stuck:
+            if self.out_of_time(margin=300):
+                break
             self.maybe_finish(b, fid)
         if self.idle_since and time.time() - self.meta.get("discovered_at", 0) > 6 * 3600:
             log("search space exhausted - looking for new datasets")
@@ -1112,6 +1121,7 @@ def cmd_run():
         log(f"cannot log in to BRAIN: {e}")
         sys.exit(2)
     deadline = time.time() + MINUTES * 60 if MINUTES > 0 else None
+    m.deadline = deadline
     m.discover(b)
     m.refresh_submitted(b)
     m.build_combos()

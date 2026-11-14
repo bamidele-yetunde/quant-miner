@@ -24,7 +24,7 @@ jobs:
       MINER_STATE_KEY: ${{ secrets.MINER_STATE_KEY }}
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-      MINER_MINUTES: ${{ vars.MINER_MINUTES || '335' }}
+      MINER_MINUTES: ${{ vars.MINER_MINUTES || '320' }}
       MINER_MAX_SIMS_PER_DAY: ${{ vars.MINER_MAX_SIMS_PER_DAY || '5000' }}
       MINER_TELEGRAM: ${{ vars.MINER_TELEGRAM || 'all' }}
       MINER_SCOPES: ${{ vars.MINER_SCOPES }}
